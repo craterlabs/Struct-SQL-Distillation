@@ -1,0 +1,418 @@
+================================================================================
+  DATA GENERATION GUIDE
+  Struct-SQL Distillation -- Curated Training Data Pipeline
+================================================================================
+
+This guide walks through every configuration and input required to run
+generate_data.py, which produces the stratified training and validation
+datasets used for knowledge distillation.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+  1. Overview
+  2. Prerequisites
+  3. Directory & File Layout
+  4. Configuration (config.ini)
+  5. Input Data Requirements
+  6. Command-Line Arguments
+  7. What the Level File Does
+  8. How Stratified Sampling Works
+  9. Output Files
+  10. Resumability & Caching
+  11. Full Example Run
+  12. Troubleshooting
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+generate_data.py is the entry point for creating curated distillation datasets.
+The pipeline runs in two steps:
+
+  Step 1 -- SQL Complexity Classification
+      Reads the raw BIRD training questions, classifies every SQL query into
+      one of four complexity levels (L1-L4), and writes a "level file".
+
+  Step 2 -- Stratified Data Curation
+      Splits databases into in-domain / out-of-domain pools, then runs a
+      4-stage sampling pipeline to produce balanced train, val-in-domain,
+      and val-out-of-domain JSON files.
+
+      The curation pipeline runs 4 stages per split:
+        Stage 1: Fill from previously cached successful inferences
+        Stage 2: Targeted LLM inference on unfilled complexity categories
+        Stage 3: Backfill from remaining cache + ensure database coverage
+        Stage 4: Active inference on any remaining candidates
+
+================================================================================
+2. PREREQUISITES
+================================================================================
+
+  - Python 3.10+
+  - Install dependencies:
+        pip install -r requirements.txt
+
+  - The BIRD benchmark dataset (training split) must be downloaded and placed
+    under ./data/BIRD/train/. See Section 3 for the exact layout.
+
+  - An Azure OpenAI API endpoint is required for Stage 2-4 LLM inference.
+    If you only want to run classification (Step 1) without inference,
+    the pipeline will still produce the level file and attempt curation
+    from any existing cache.
+
+================================================================================
+3. DIRECTORY & FILE LAYOUT
+================================================================================
+
+Before running, your project should look like this:
+
+  Struct-SQL-Distillation/
+  |
+  |-- config.ini                        <-- Main configuration file
+  |-- generate_data.py                  <-- Entry point (you run this)
+  |-- prompts/
+  |   |-- structsql.txt                 <-- Prompt template for LLM calls
+  |
+  |-- data/
+  |   |-- BIRD/
+  |   |   |-- train/
+  |   |   |   |-- train.json            <-- Raw BIRD training questions (*)
+  |   |   |   |-- train_tables.json     <-- BIRD training schema metadata (*)
+  |   |   |   |-- train_databases/      <-- Directory of SQLite DB folders (*)
+  |   |   |       |-- student_club/
+  |   |   |       |   |-- student_club.sqlite
+  |   |   |       |-- movie_platform/
+  |   |   |       |   |-- movie_platform.sqlite
+  |   |   |       |-- ...
+  |   |
+  |   |-- kd_data/                      <-- Default output directory
+  |       |-- train_question_level.json  <-- Generated level file (auto-created)
+  |
+  |-- src/                              <-- Source modules (do not modify)
+
+  (*) These files come from the BIRD benchmark. Download from:
+      https://bird-bench.github.io/
+
+================================================================================
+4. CONFIGURATION (config.ini)
+================================================================================
+
+generate_data.py reads settings from config.ini. The relevant sections are:
+
+  [azure_openai]
+  ~~~~~~~~~~~~~~
+  Required for LLM inference during data curation (Stages 2–4).
+
+    azure_endpoint       = <your Azure OpenAI endpoint URL>
+    api_key              = <your API key>
+    api_version          = 2024-12-01-preview
+    chat_deployment_name = gpt-4o    (the key read by the code)
+    temperature          = 0.0       (deterministic generation)
+    max_tokens           = 5000
+    top_p                = 1.0
+
+  Note: deployment_name and model_name may appear in config.ini.example for
+  reference but are not read by ConfigLoader. Only chat_deployment_name matters.
+
+  [database]
+  ~~~~~~~~~~
+  Paths to the SQLite database directories.
+
+    db_type                  = sqlite
+    database_root_path       = ./data/BIRD/dev_databases
+    database_train_root_path = ./data/BIRD/train/train_databases
+
+  Only database_train_root_path is used by generate_data.py.
+  Each subdirectory under this path should contain a single .sqlite file
+  named after the database (e.g., student_club/student_club.sqlite).
+
+  [bird_training_paths]
+  ~~~~~~~~~~~~~~~~~~~~~
+  Paths to BIRD training data. This is the most critical section.
+
+    train_questions_json_path       = ./data/BIRD/train/train.json
+    train_tables_json_path          = ./data/BIRD/train/train_tables.json
+    bird_train_db_root              = ./data/BIRD/train/train_databases
+    train_questions_level_json_path = ./data/kd_data/train_question_level.json
+
+  - train_questions_json_path:
+      The raw BIRD training questions file. This is the INPUT that gets
+      classified in Step 1. Each record must have at minimum:
+      { "db_id": "...", "question": "...", "SQL": "..." }
+
+  - train_tables_json_path:
+      BIRD schema metadata. Used by DatabaseManager to build semantic
+      schema context for LLM prompts.
+
+  - bird_train_db_root:
+      Root directory containing one subfolder per database, each with
+      a .sqlite file inside.
+
+  - train_questions_level_json_path:
+      Path where the LEVEL FILE will be written (or read from if it
+      already exists). See Section 7 for details.
+
+  [paths]
+  ~~~~~~~
+  General output paths.
+
+    kd_data_dir = ./data/kd_data    (default output location)
+
+================================================================================
+5. INPUT DATA REQUIREMENTS
+================================================================================
+
+The primary input is the BIRD training questions JSON file, configured at:
+    [bird_training_paths] > train_questions_json_path
+
+Format: A JSON array of objects. Each object must contain:
+
+  {
+      "db_id":       "student_club",          <-- which database this belongs to
+      "question":    "How many members ...?",  <-- natural language question
+      "SQL":         "SELECT COUNT(*) ...",    <-- gold SQL query
+      "evidence":    "optional hint text"      <-- optional, can be empty string
+  }
+
+  - "question_id" is optional. If missing, the script auto-assigns sequential
+    integer IDs starting from 0.
+  - "evidence" is optional and defaults to empty string if absent.
+  - "SQL" is required -- it is used both for complexity classification and
+    for execution-match verification during inference.
+
+The corresponding databases must exist under the train database root path.
+For every unique "db_id" in the questions file, there must be a matching
+directory: <bird_train_db_root>/<db_id>/<db_id>.sqlite
+
+================================================================================
+6. COMMAND-LINE ARGUMENTS
+================================================================================
+
+  python generate_data.py [OPTIONS]
+
+  --config <path>         Path to config.ini.
+                          Default: config.ini (project root)
+
+  --output_dir <path>     Where to save the curated train/val JSON files.
+                          This is REQUIRED.
+                          Example: ./data/kd_data/
+
+  --train_size <int>      Target number of training samples.
+                          Default: 1000
+                          The pipeline distributes this evenly across the
+                          4 complexity levels (25% each).
+
+  --val_id_size <int>     Target number of in-domain validation samples.
+                          Default: 150
+
+  --val_ood_size <int>    Target number of out-of-domain validation samples.
+                          Default: 150
+
+  SIZE GUIDELINES:
+    The BIRD training set has ~9,428 questions across ~69 databases.
+    Reasonable size ranges:
+      --train_size   500  to 3000  (paper used 2000)
+      --val_id_size  100  to 300
+      --val_ood_size 100  to 500
+
+    Larger sizes require more successful LLM inferences. If fewer
+    questions pass execution-match verification, the pipeline may
+    not reach the full target size.
+
+================================================================================
+7. WHAT THE LEVEL FILE DOES
+================================================================================
+
+The "level file" is an enriched copy of the raw training questions where
+every record has an added "level" field indicating SQL complexity.
+
+Path (from config.ini):
+    [bird_training_paths] > train_questions_level_json_path
+
+Default: ./data/kd_data/train_question_level.json
+
+COMPLEXITY LEVELS:
+
+  Level 4: JOINs / Set Ops with Subquery
+      SQL that contains JOINs or set operations (UNION/INTERSECT/EXCEPT)
+      AND has nested subqueries (multiple SELECT statements).
+      Example: SELECT ... FROM A JOIN B WHERE x IN (SELECT ...)
+
+  Level 3: JOINs / Set Ops without Subquery
+      SQL with JOINs or set operations but no nested subqueries.
+      Example: SELECT ... FROM A JOIN B ON ...
+
+  Level 2: Subquery
+      SQL with nested subqueries but no JOINs or set operations.
+      Example: SELECT ... WHERE x IN (SELECT ...)
+
+  Level 1: Basic Query
+      Simple queries -- single table, no subqueries, no JOINs.
+      Includes ORDER BY, GROUP BY, HAVING, aggregations.
+      Example: SELECT COUNT(*) FROM students GROUP BY major
+
+  Other/Uncategorized
+      Empty or unparseable SQL strings. These are excluded from
+      curation targets (0% allocation).
+
+WHY IT MATTERS:
+  The level file drives the stratified sampling. The curation pipeline
+  ensures the final datasets have balanced representation across all four
+  complexity levels (25% each by default). Without it, training data
+  would be dominated by simpler queries.
+
+BEHAVIOR:
+  - If the level file does NOT exist: generate_data.py creates it
+    automatically by classifying every SQL in the raw training file.
+  - If the level file ALREADY exists: the script reuses it as-is.
+    Delete it manually to force re-classification.
+
+================================================================================
+8. HOW STRATIFIED SAMPLING WORKS
+================================================================================
+
+After classification, the pipeline delegates to struct_data_builder.py
+which orchestrates the actual curation.
+
+  a) DATABASE SPLIT
+     All unique db_ids are split into two pools:
+       - In-Domain  (80% of databases by default)
+       - Out-of-Domain (remaining 20%)
+
+  b) TARGET DISTRIBUTION
+     The requested sizes are distributed evenly across levels:
+       Level 4: 25%,  Level 3: 25%,  Level 2: 25%,  Level 1: 25%
+     Example: --train_size 2000 => 500 per level
+
+  c) IN-DOMAIN CURATION (produces train.json + val_in_domain.json)
+     Stage 1: Fill from cached successful inference results
+     Stage 2: Run LLM inference on questions in unfilled categories
+     Stage 3: Backfill from remaining cache + ensure DB coverage
+     Stage 4: Active inference on any leftover candidates
+
+  d) OUT-OF-DOMAIN CURATION (produces val_out_of_domain.json)
+     Same 4-stage process, but using only out-of-domain databases.
+
+  "Successful inference" means:
+     - The LLM generated valid SQL (parsed from markdown code block)
+     - The generated SQL executed without errors
+     - The result set matches the gold SQL's result set exactly
+
+================================================================================
+9. OUTPUT FILES
+================================================================================
+
+All outputs are saved to the --output_dir directory:
+
+  <output_dir>/
+  |-- train.json               Main training set
+  |-- val_in_domain.json       In-domain validation set
+  |-- val_out_of_domain.json   Out-of-domain validation set
+  |-- individual_results/      Per-question inference cache
+  |   |-- 0.json
+  |   |-- 1.json
+  |   |-- ...
+
+  Each record in train.json / val_*.json contains:
+
+  {
+      "question_id":       42,
+      "db_id":             "student_club",
+      "question":          "How many members ...?",
+      "SQL":               "SELECT COUNT(*) ...",
+      "evidence":          "hint text",
+      "level":             "Level 3: JOINs / Set Ops without Subquery",
+      "predicted_sql":     "SELECT COUNT(*) ...",
+      "final_reasoning":   "**Query Plan**: First identify ...",
+      "generation_status": "Success",
+      "execution_match":   true,
+      "raw_output":        "<full LLM response>"
+  }
+
+  The individual_results/ directory holds one JSON file per question_id.
+  These serve as the inference cache for resumability.
+
+================================================================================
+10. RESUMABILITY & CACHING
+================================================================================
+
+The pipeline is designed to be interrupted and resumed:
+
+  - Individual inference results are cached in <output_dir>/individual_results/.
+    If a question_id has already been processed, its cached result is reused.
+
+  - The final output files (train.json, val_*.json) are also loaded on
+    restart. Any question_id already present in these files is "locked"
+    and skipped during new sampling.
+
+  - To do a completely fresh run, delete:
+      <output_dir>/train.json
+      <output_dir>/val_in_domain.json
+      <output_dir>/val_out_of_domain.json
+      <output_dir>/individual_results/
+
+  - To force re-classification, also delete:
+      <kd_data_dir>/train_question_level.json
+
+================================================================================
+11. FULL EXAMPLE RUN
+================================================================================
+
+  # 1. Make sure BIRD training data is in place
+  ls data/BIRD/train/train.json
+  ls data/BIRD/train/train_tables.json
+  ls data/BIRD/train/train_databases/
+
+  # 2. Set your Azure OpenAI credentials in config.ini
+  #    (edit [azure_openai] section)
+
+  # 3. Run data generation
+  python generate_data.py \
+      --config config.ini \
+      --output_dir ./data/kd_data/ \
+      --train_size 2000 \
+      --val_id_size 150 \
+      --val_ood_size 350
+
+  # 4. Verify outputs
+  ls data/kd_data/train.json
+  ls data/kd_data/val_in_domain.json
+  ls data/kd_data/val_out_of_domain.json
+
+  # 5. Check record counts
+  python -c "import json; d=json.load(open('data/kd_data/train.json')); print(len(d))"
+
+================================================================================
+12. TROUBLESHOOTING
+================================================================================
+
+  "0 of N records passed validation"
+      The level file exists but records are missing the 'level' field.
+      Delete the level file and re-run to regenerate it:
+        rm data/kd_data/train_question_level.json
+
+  "Path '...' does not exist"
+      A path in config.ini points to a missing file or directory.
+      Verify the BIRD dataset is downloaded and paths match.
+
+  "Could not extract API key or Base URL from LLM instance"
+      Azure OpenAI credentials in config.ini are still placeholder values.
+      Update [azure_openai] with real endpoint and api_key.
+
+  "Context length exceeded"
+      A database schema is too large for the LLM context window.
+      The pipeline automatically retries with reduced schema rows
+      (3 -> 1 -> 0) and skips if still too large.
+
+  Pipeline stalls or is slow
+      Each LLM API call has exponential backoff (4s, 8s, 16s, 32s, 64s)
+      with up to 5 retries. Large runs with thousands of questions can
+      take hours. Use resumability -- stop and restart safely anytime.
+
+  "Initialization of LLM/DB components failed"
+      The Azure OpenAI connection could not be established. Inference
+      stages (2-4) will be skipped, but Stage 1 (cache-based) will
+      still run if cached results exist.
+
+================================================================================

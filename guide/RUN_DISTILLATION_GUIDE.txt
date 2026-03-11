@@ -1,0 +1,240 @@
+================================================================================
+  RUN DISTILLATION GUIDE
+  Struct-SQL -- LoRA Knowledge Distillation Training
+================================================================================
+
+This guide covers running run_kdistill.py to train a student model using
+LoRA-based knowledge distillation on the BIRD text-to-SQL benchmark.
+
+--------------------------------------------------------------------------------
+1. PREREQUISITES
+--------------------------------------------------------------------------------
+
+  - Python 3.10+
+  - GPU with sufficient VRAM (L4 24GB minimum, A100/H100 recommended)
+  - Install dependencies:
+        pip install -r requirements.txt
+
+  - BIRD benchmark training data under ./data/BIRD/train/
+  - A config file (config.ini)
+
+  Note: flash-attn is NOT required. The code uses PyTorch native SDPA by
+  default. To use FlashAttention-2 instead, install it separately:
+      pip install flash-attn --no-build-isolation
+  No code changes are needed — _detect_attn_implementation() in
+  src/llm_initializer.py detects flash-attn automatically and passes
+  the correct backend to the model loader.
+
+--------------------------------------------------------------------------------
+2. DIRECTORY LAYOUT
+--------------------------------------------------------------------------------
+
+  Struct-SQL-Distillation/
+  |-- run_kdistill.py                 <-- Entry point
+  |-- config.ini                      <-- Configuration file
+  |-- data/
+  |   |-- BIRD/
+  |   |   |-- train/
+  |   |   |   |-- train.json          <-- BIRD training questions
+  |   |   |   |-- train_tables.json   <-- Schema metadata
+  |   |   |   |-- train_databases/    <-- SQLite DB folders
+  |   |-- kd_data/                    <-- Local JSON data (if not using HF)
+  |       |-- train.json
+  |       |-- val_in_domain.json
+  |       |-- val_out_of_domain.json
+  |-- exp_results/                    <-- Output checkpoints & adapters
+
+--------------------------------------------------------------------------------
+3. DATA SOURCES
+--------------------------------------------------------------------------------
+
+  The pipeline supports three data sources (checked in this order):
+
+  a) HuggingFace dataset (--dataset flag)
+     Loads directly from HuggingFace, bakes schema context on the fly.
+     Example: --dataset craterlabs/struct-sql-data
+
+  b) Local JSON files (from generate_data.py)
+     Uses train.json, val_in_domain.json, val_out_of_domain.json from
+     the kd_data_dir path in config.ini.
+
+  c) Auto-fallback to HuggingFace
+     If --dataset is not provided AND local JSON files are missing, the
+     pipeline automatically downloads from craterlabs/struct-sql-data
+     with a warning message.
+
+  IMPORTANT: Both options (a) and (c) require the BIRD training databases
+  to be present locally (for schema baking). The HuggingFace dataset
+  contains question/db_id/query_plan/predicted_sql but NOT the schemas.
+
+--------------------------------------------------------------------------------
+4. COMMAND-LINE ARGUMENTS
+--------------------------------------------------------------------------------
+
+  python run_kdistill.py [OPTIONS]
+
+  --config-file <path>    Path to config INI file.
+                          Default: config.ini
+
+  --dataset <name>        HuggingFace dataset to load.
+                          Example: craterlabs/struct-sql-data
+                          When omitted, uses local JSON files.
+
+  --mode <auto|ddp>       Training distribution strategy.
+                          Default: ddp (Distributed Data Parallel)
+                          Use 'ddp' with `accelerate launch` for multi-GPU.
+                          Use 'auto' for single-GPU or CPU setups where
+                          device_map="auto" is preferred over DDP.
+
+--------------------------------------------------------------------------------
+5. EXPERIMENT CONFIGURATION
+--------------------------------------------------------------------------------
+
+  Experiments are defined as dictionaries in run_kdistill.py. Each dict
+  represents one training run with its own hyperparameters:
+
+    {
+        "model_name":    "Qwen/Qwen3-4B-Instruct-2507",
+        "resume":        True,       # Resume from last checkpoint
+        "lora_r":        64,         # LoRA rank
+        "lora_alpha":    128,        # LoRA alpha (scaling factor)
+        "learning_rate": 1e-4,       # Optimizer learning rate
+        "batch_size":    6,          # Per-device batch size
+        "epochs":        10,         # Max training epochs
+        "quantization":  4,          # 4-bit or 8-bit (or None for full)
+        "max_steps":     -1,         # -1 = use epochs; positive int = cap steps
+    }
+
+  PARAMETER OVERRIDE PRIORITY:
+    Experiment config dict  >  [distillation_parameters] in config.ini  >  defaults
+
+  Additional parameters from config.ini [distillation_parameters]:
+    max_length       = 15000   # Max input sequence length (tokens)
+    max_new_tokens   = 2000    # Max tokens for evaluation generation
+
+  DEBUGGING TIP:
+    Set "max_steps": 5 to run just 5 training steps for a quick sanity check.
+
+--------------------------------------------------------------------------------
+6. TRAINING DETAILS
+--------------------------------------------------------------------------------
+
+  Model Setup:
+    - Base model loaded in bfloat16 with 4-bit NF4 quantization (default)
+    - SDPA attention (PyTorch native, no extra dependencies)
+    - LoRA adapters on: q_proj, v_proj, k_proj, o_proj, gate_proj,
+      up_proj, down_proj
+
+  Training Config (SFTTrainer):
+    - Optimizer: paged_adamw_32bit
+    - Gradient accumulation: 6 steps
+    - Warmup: 10 steps
+    - Completion-only loss (model only learns from the response, not the prompt)
+    - Gradient checkpointing enabled
+    - bf16 precision
+    - Eval every 20 steps, checkpoint every 20 steps
+
+  Early Stopping:
+    - Patience: 8 evaluation rounds (160 steps without improvement)
+    - Threshold: 0.001 improvement in eval_loss
+    - Best model is loaded at the end of training
+
+  Pre-Flight Checks (automatic):
+    - EOS token masking verification
+    - Completion-only loss transition check
+    - Effective batch size calculation
+    - Estimated time between loss updates
+
+--------------------------------------------------------------------------------
+7. OUTPUT STRUCTURE
+--------------------------------------------------------------------------------
+
+  exp_results/
+  |-- KDS_QPPro_<model>_R<r>A<alpha>_LR<lr>E<epochs>Q<quant>/
+  |   |-- model_kd_data_<model-name>/
+  |   |   |-- static_baked/           <-- Baked HF dataset (if using --dataset)
+  |   |   |-- train_raw/              <-- Processed training data
+  |   |   |-- all_raw_eval/           <-- Combined validation data
+  |   |   |-- val_in_domain/          <-- In-domain validation split
+  |   |   |-- val_out_of_domain/      <-- Out-of-domain validation split
+  |   |   |-- checkpoint-<N>/         <-- Training checkpoints
+  |   |   |-- lora_adapter/           <-- Final saved LoRA adapter weights
+  |   |   |   |-- adapter_model.safetensors
+  |   |   |   |-- adapter_config.json
+
+  The lora_adapter/ directory is the final output. Use it for inference by
+  loading the base model + adapter via PEFT, or merge them into a single
+  model for deployment.
+
+--------------------------------------------------------------------------------
+8. CHECKPOINT RESUMPTION
+--------------------------------------------------------------------------------
+
+  Set "resume": True in the experiment config. The trainer will:
+    1. Scan the output directory for existing checkpoints
+    2. Verify the latest checkpoint has adapter_model.safetensors and
+       adapter_config.json
+    3. Resume training from that checkpoint if valid
+    4. Start fresh if no valid checkpoint found
+
+  To force a fresh start, delete the checkpoint directories:
+    rm -rf exp_results/KDS_QPPro_*/model_kd_data_*/checkpoint-*
+
+--------------------------------------------------------------------------------
+9. FULL EXAMPLE RUNS
+--------------------------------------------------------------------------------
+
+  # Quick debug run (5 steps only):
+  python run_kdistill.py \
+      --config-file config.ini \
+      --dataset craterlabs/struct-sql-data
+
+  (set "max_steps": 5 in the experiment config first)
+
+  # Full training from HuggingFace dataset:
+  python run_kdistill.py \
+      --config-file config.ini \
+      --dataset craterlabs/struct-sql-data
+
+  # Full training from local JSON files (generated by generate_data.py):
+  python run_kdistill.py \
+      --config-file config.ini
+
+  # Multi-GPU with accelerate:
+  accelerate launch run_kdistill.py \
+      --config-file config.ini \
+      --dataset craterlabs/struct-sql-data
+
+--------------------------------------------------------------------------------
+10. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  "SFTConfig got an unexpected keyword argument"
+      Your trl version may not support a parameter. Check trl version:
+        pip show trl
+      Update if needed: pip install --upgrade trl
+
+  "CUDA OOM"
+      Reduce batch_size in the experiment config (try 1 or 2).
+      The script logs an OOM error, clears the CUDA cache, and skips
+      the current batch before continuing with the next one.
+
+  "SQLite database file path not found for db_id: ..."
+      The HF dataset references training db_ids. Ensure BIRD training
+      databases are at: ./data/BIRD/train/train_databases/
+
+  "train_tables.json not found"
+      Verify the path in config.ini [bird_training_paths] section.
+
+  "No valid checkpoint found"
+      Normal for first run. Training starts fresh.
+
+  Trainable params shows 0
+      This is expected before SFTTrainer applies LoRA. The real count
+      is logged after trainer initialization (look for "trainable%").
+
+  Loss is NaN or 0.0 after first update
+      Kill the run. Check data masking output -- completion_only_loss
+      may not be working correctly with your data format.
+
+================================================================================

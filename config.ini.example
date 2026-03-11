@@ -1,0 +1,106 @@
+# =============================================================================
+# Configuration Template
+# =============================================================================
+# SETUP INSTRUCTIONS:
+#   1. Copy this file:  cp config.ini.example config.ini
+#   2. Fill in every value marked with ">>> UPDATE THIS"
+#   3. Never commit config.ini — it is gitignored
+# =============================================================================
+
+[azure_openai]
+# Azure OpenAI API version (update if your Azure deployment uses a different version)
+api_version = 2024-12-01-preview
+
+# >>> UPDATE THIS: Your Azure OpenAI endpoint URL (e.g. https://your-resource.openai.azure.com/)
+azure_endpoint = https://your-resource.openai.azure.com/
+
+# >>> UPDATE THIS: Your Azure OpenAI API key
+api_key = YOUR_API_KEY_HERE
+
+# >>> UPDATE THIS: Your Azure OpenAI chat deployment name (the value read by the code)
+chat_deployment_name = gpt-4o
+
+# Reference-only — not read by ConfigLoader; kept for documentation purposes.
+# deployment_name and model_name are informational labels for your own reference.
+deployment_name = gpt-4o
+model_name = gpt-4o
+
+# --- Optional LLM Parameters (sensible defaults provided) ---
+# LLM sampling temperature (0.0 = deterministic, increase for more creative output)
+temperature = 0.0
+# Max tokens for LLM response
+max_tokens = 5000
+# Nucleus sampling parameter (controls diversity, 1.0 = no filtering)
+top_p = 1.0
+
+[database]
+# Database type (e.g., 'sqlite')
+db_type = sqlite
+
+# >>> UPDATE THIS: Root path to your BIRD dev database files
+database_root_path = ./data/BIRD/dev/dev_databases
+# >>> UPDATE THIS: Root path to your BIRD training database files
+database_train_root_path = ./data/BIRD/train/train_databases
+
+[bird_dataset_paths]
+# >>> UPDATE THESE: Paths to your BIRD dev dataset files
+# Path to BIRD dev tables JSON
+dev_tables_json_path = ./data/BIRD/dev/dev_tables.json
+# Path to BIRD dev questions JSON
+dev_questions_json_path = ./data/BIRD/dev/dev.json
+# Path to BIRD dev tied append JSON
+dev_tied_append_json_path = ./data/BIRD/dev/dev_tied_append.json
+
+[paths]
+# >>> UPDATE THESE: Base directory paths for data, output, model cache, and KD data
+base_data_dir = ./data
+base_output_dir = ./exp_results
+model_cache_dir = ./models/cache/hf/
+kd_data_dir = ./data/kd_data
+
+[bird_training_paths]
+# >>> UPDATE THESE: Paths to your BIRD training dataset files
+train_questions_json_path = ./data/BIRD/train/train.json
+train_tables_json_path = ./data/BIRD/train/train_tables.json
+bird_train_db_root = ./data/BIRD/train/train_databases
+train_questions_level_json_path = ./data/kd_data/train_question_level.json
+
+[distillation_parameters]
+# --- LoRA fine-tuning hyperparameters (adjust based on your model and hardware) ---
+lora_r = 64
+lora_alpha = 128
+learning_rate = 1e-4
+batch_size = 6
+epochs = 1
+# Quantization bits (4 or 8); lower = less memory, slightly less accuracy
+quantization = 4
+# Maximum input sequence length for training (tokens)
+max_length = 15000
+# Maximum new tokens to generate during evaluation/inference
+max_new_tokens = 2000
+# Train/validation split ratios (must sum to 1.0)
+train_split_percentage = 0.8
+val_split_percentage = 0.2
+
+[training]
+# --- Training loop parameters (adjust based on your hardware and dataset size) ---
+gradient_accumulation_steps = 6
+logging_steps = 10
+eval_steps = 20
+save_steps = 20
+warmup_steps = 10
+early_stopping_patience = 8
+early_stopping_threshold = 0.001
+seed = 42
+optim = paged_adamw_32bit
+
+[bird_kd_paths]
+# ADVANCED / OPTIONAL — not used by the default entry-point scripts.
+# This section is read by ConfigLoader.get_bird_kd_dataset_paths() for
+# workflows that use a pre-filtered or custom KD training file (train_kd.json)
+# instead of the full BIRD training set referenced in [bird_training_paths].
+# You can safely ignore this section unless you have generated train_kd.json
+# separately and are loading it via that method.
+train_questions_json_path = ./data/BIRD/train/train_kd.json
+train_tables_json_path = ./data/BIRD/train/train_tables.json
+bird_train_db_root = ./data/BIRD/train/train_databases

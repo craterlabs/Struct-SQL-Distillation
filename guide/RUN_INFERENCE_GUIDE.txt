@@ -1,0 +1,131 @@
+================================================================================
+  RUN INFERENCE GUIDE
+  Struct-SQL -- Batch Inference on BIRD Benchmark
+================================================================================
+
+This guide covers running run_inference.py to generate SQL predictions
+from a fine-tuned model on the BIRD benchmark.
+
+--------------------------------------------------------------------------------
+1. PREREQUISITES
+--------------------------------------------------------------------------------
+
+  - Python 3.10+
+  - Install dependencies: pip install -r requirements.txt
+  - GPU with sufficient VRAM (L4 / A100 recommended)
+  - BIRD benchmark data (dev or test split)
+
+--------------------------------------------------------------------------------
+2. DIRECTORY LAYOUT
+--------------------------------------------------------------------------------
+
+  Struct-SQL-Distillation/
+  |-- run_inference.py              <-- Entry point
+  |-- run.sh                        <-- Convenience wrapper script
+  |-- prompts/
+  |   |-- structsql.txt             <-- Prompt template
+  |-- data/BIRD/dev/
+  |   |-- dev.json                  <-- Input questions (*)
+  |   |-- dev_tables.json           <-- Schema metadata (*)
+  |   |-- dev_databases/            <-- SQLite database folders (*)
+  |       |-- student_club/student_club.sqlite
+  |       |-- ...
+  |-- exp_results/                  <-- Output directory
+
+  (*) From the BIRD benchmark: https://bird-bench.github.io/
+
+--------------------------------------------------------------------------------
+3. COMMAND-LINE ARGUMENTS
+--------------------------------------------------------------------------------
+
+  python run_inference.py \
+      --input_file   ./data/BIRD/dev/dev.json \
+      --db_path      ./data/BIRD/dev/dev_databases/ \
+      --tables_file  ./data/BIRD/dev/dev_tables.json \
+      --model_path   craterlabs/Struct-SQL \
+      --prompt_file  ./prompts/structsql.txt \
+      --output_file  ./exp_results/predict_dev.json \
+      --batch_size   2
+
+  --input_file   (required)  BIRD questions JSON array
+  --db_path      (required)  Root directory containing SQLite DB folders
+  --tables_file  (required)  BIRD schema metadata (tables.json)
+  --model_path   (required)  HuggingFace model ID or local path
+  --prompt_file  (required)  Prompt template with placeholders
+  --output_file  (default: predict_dev.json)  Where to save predictions
+  --batch_size       (default: 2)     Queries per GPU batch (2-8 depending on VRAM)
+  --max_new_tokens   (default: 2000)  Max tokens generated per query
+
+  Or simply run the wrapper:  bash run.sh
+
+--------------------------------------------------------------------------------
+4. HOW IT WORKS
+--------------------------------------------------------------------------------
+
+  1. Load & Resume
+     - Loads input questions from --input_file
+     - If --output_file exists, loads completed results and skips them
+
+  2. Model Loading
+     - Loads model in bfloat16 with device_map="auto"
+     - Configures left-padding for batched generation
+
+  3. Schema & Prompt Construction
+     For each question:
+     - Builds semantic schema with sample rows via DatabaseManager
+     - Fills the prompt template (schema + question + hint) via
+       prompt_template.format() and passes it directly to the tokenizer
+
+  4. Batched Generation
+     - Tokenizes batch with padding, runs model.generate()
+     - Greedy decoding (do_sample=False), max 2000 new tokens
+     - Strips prompt tokens before decoding output
+
+  5. SQL Extraction
+     - Extracts SQL from ```sql ... ``` blocks
+     - Falls back to heuristic scanning for SELECT/WITH statements
+     - Appends trailing semicolon if missing
+
+  6. Checkpoint Save
+     - Saves results after every batch (survives interruptions)
+     - On CUDA OOM, clears cache and skips to next batch
+
+--------------------------------------------------------------------------------
+5. OUTPUT FILES
+--------------------------------------------------------------------------------
+
+  predict_dev.json (BIRD submission format):
+    {
+      "0": "SELECT COUNT(*) FROM t;\t----- bird -----\tdb_name",
+      "1": "SELECT name FROM t WHERE ...;\t----- bird -----\tdb_name",
+      ...
+    }
+
+  predict_dev_raw.jsonl (one JSON object per line):
+    {"question_id": "0", "raw_content": "<full model response>"}
+
+--------------------------------------------------------------------------------
+6. RESUMABILITY
+--------------------------------------------------------------------------------
+
+  The pipeline auto-resumes from --output_file. To start fresh, delete:
+    rm exp_results/predict_dev.json exp_results/predict_dev_raw.jsonl
+
+--------------------------------------------------------------------------------
+7. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  "CUDA OOM"
+    Reduce --batch_size (try 1). The script auto-recovers and continues.
+
+  "Could not import src modules"
+    Set PYTHONPATH:  export PYTHONPATH=$PYTHONPATH:.
+
+  "MISSING Input Questions"
+    Verify --input_file path points to a valid BIRD JSON file.
+
+  Empty or wrong SQL in output
+    Check predict_dev_raw.jsonl for the full model response.
+    The SQL extractor expects ```sql blocks or bare SELECT statements.
+
+================================================================================
